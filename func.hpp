@@ -191,7 +191,7 @@ public:
     {}
 
     template <std::invocable<Args...> F>
-    FunctionContainer (F && callable) 
+    FunctionContainer (F && callable) requires (!std::same_as<std::decay_t<F>, FunctionContainer>)
     // requires (cfg.allow_return_type_conversion ? 
         // (invocable<F, R(Args...)> || std::is_void_v<R>) 
         // : 
