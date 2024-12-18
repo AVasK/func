@@ -65,37 +65,74 @@ private:
     const char * const error_message = "";
 };
 
+// SBO memory
+template <std::size_t capacity, std::size_t alignment>
+union memory_SBO {
+    alignas(alignment) std::byte sbo [capacity];
+    void* ptr;
+    const void* const_ptr;
+
+    template <typename F>
+    F& as_sbo() {
+        return reinterpret_cast<F&>(*this);
+    }
+
+    template <typename F>
+    F const& as_sbo() const {
+        return reinterpret_cast<F const&>(*this);
+    }
+
+    template <typename F>
+    F*& ptr_to() {
+        return reinterpret_cast<F*&>(*this);
+    }
+
+    template <typename F>
+    const F* const& ptr_to() const {
+        return reinterpret_cast<const F* const&>(*this);
+    }
+
+    template <typename F>
+    void move_into_sbo(memory_SBO * other) {
+        new(other) F(std::move(as_sbo<F>()));
+    }
+
+    template <typename>
+    void move_into_ptr(memory_SBO * other) {
+        other->ptr = ptr;
+        ptr = nullptr;
+    }
+
+    template <typename F>
+    void copy_into_sbo(memory_SBO * dest) const noexcept(std::is_nothrow_copy_constructible_v<F>) {
+        dest->template as_sbo<F>() = this->as_sbo<F>();
+    }
+
+    template <typename F>
+    void copy_into_ptr(memory_SBO * dest) const noexcept(std::is_nothrow_copy_constructible_v<F>) {
+        dest->template ptr_to<F>() = new F(*this->ptr_to<F>());
+    }
+
+    template <typename F>
+    void del_sbo() { as_sbo<F>().~F(); }
+
+    template <typename F>
+    void del_ptr() { delete ptr_to<F>(); }
+};
+
 
 template <configuration::function cfg, typename R, typename... Args>
 class FunctionContainer {
+public:
+    template <typename F>
+    static constexpr bool is_sbo_eligible = sizeof(F) <= cfg.SBO && ///< fits into SBO buffer
+                                     alignof(F) <= cfg.alignment && ///< and has lower alignment
+                                     (cfg.alignment % alignof(F) == 0) && 
+                                     (!cfg.require_nothrow_movable || std::is_nothrow_move_constructible_v<F>);
+
+private:
     static constexpr auto bufsize = std::max(cfg.SBO, std::size_t{1});
-    using buffer_t = std::byte[bufsize];
-
-    union memory {
-        alignas(cfg.alignment) buffer_t sbo;
-        void* ptr;
-        const void* const_ptr;
-
-        template <typename F>
-        F& as_sbo() {
-            return reinterpret_cast<F&>(*this);
-        }
-
-        template <typename F>
-        F const& as_sbo() const {
-            return reinterpret_cast<F const&>(*this);
-        }
-
-        template <typename F>
-        F*& ptr_to() {
-            return reinterpret_cast<F*&>(*this);
-        }
-
-        template <typename F>
-        const F* const& ptr_to() const {
-            return reinterpret_cast<const F* const&>(*this);
-        }
-    };
+    using memory = vx::memory_SBO<bufsize, cfg.alignment>;
 
     template <typename F>
     using const_correct = std::conditional_t<(cfg.require_const_invocable), std::add_const_t<F>, F>;
@@ -107,33 +144,40 @@ class FunctionContainer {
     using invoke_f = R (*)(const_correct<memory> &, Args...);
 
     template <typename F>
-    static constexpr p_cleanup sbo_dtor_action =  +[](memory& mem) noexcept { 
-        F& data = mem.template as_sbo<F>(); 
-        data.~F(); 
+    static constexpr p_cleanup dtor_action =  +[](memory& mem) noexcept { 
+        if constexpr (is_sbo_eligible<F>) {
+            mem.template del_sbo<F>(); 
+        } else {
+            mem.template del_ptr<F>();
+        }
     };
 
     template <typename F>
-    static constexpr p_cleanup ptr_dtor_action = +[](memory& mem) noexcept { 
-        F* f = mem.template ptr_to<F>();
-        delete f;
-    };
-
-    template <typename F>
-    static constexpr p_tagfunc sbo_multiple_actions = +[](dispatch_tag cmd, memory& mem, memory* new_mem=nullptr) { 
-        F& data = mem.template as_sbo<F>(); 
+    static constexpr p_tagfunc multiple_actions = +[](dispatch_tag cmd, memory& mem, memory* new_mem=nullptr) { 
         switch (cmd) {
             case dispatch_tag::Dtor: {
-                data.~F(); 
+                if constexpr (is_sbo_eligible<F>) {
+                    mem.template del_sbo<F>();
+                } else {
+                    mem.template del_ptr<F>();
+                }
             } break;
 
             case dispatch_tag::Move: {
-                new(new_mem) F(std::move(data));
+                if constexpr (is_sbo_eligible<F>) {
+                    mem.template move_into_sbo<F>(new_mem);
+                } else {
+                    mem.template move_into_ptr<F>(new_mem);
+                }
             } break;
 
             case dispatch_tag::Copy: {
                 if constexpr (cfg.copyable) {
-                    auto& new_data = new_mem->template as_sbo<F>();
-                    new_data = data;
+                    if constexpr (is_sbo_eligible<F>) {
+                        mem.template copy_into_sbo<F>(new_mem);
+                    } else {
+                        mem.template copy_into_ptr<F>(new_mem);
+                    }
                 } else {
                     VX_UNREACHABLE();
                 }
@@ -142,25 +186,25 @@ class FunctionContainer {
     };
 
     template <typename F>
-    static constexpr p_tagfunc ptr_multiple_actions = +[](dispatch_tag cmd, memory& mem, memory* new_mem=nullptr) { 
-        F* f = mem.template ptr_to<F>(); 
-        switch (cmd) {
-            case dispatch_tag::Dtor: {
-                delete f;
-            } break;
+    static auto& as_invocable(const_correct<memory>& mem) {
+        if constexpr (is_sbo_eligible<F>) {
+            return mem.template as_sbo<F>();
+        } else {
+            return *mem.template ptr_to<F>();
+        }
+    }
 
-            case dispatch_tag::Move: {
-                // new(new_mem) (F*)(f);
-                new_mem->ptr = f;
-                f = nullptr;
-            } break;
-
-            case dispatch_tag::Copy: {
-                if constexpr (cfg.copyable) {
-                    F*& new_ptr = new_mem->template ptr_to<F>();
-                    new_ptr = new F(*f);
-                }
-            } break;
+    template <typename F>
+    static constexpr invoke_f caller_for = +[](const_correct<memory>& mem, Args... args) {
+        auto& f = as_invocable<F>(mem);
+        if constexpr (cfg.allow_return_type_conversion) {
+            if constexpr (!std::is_void_v<R>) { 
+                return R( f(args...) ); 
+            } else {
+                f(args...);
+            }
+        } else {
+            return f(args...);
         }
     };
 
@@ -168,13 +212,6 @@ class FunctionContainer {
 
 
 public:
-
-    template <typename F>
-    static constexpr bool is_sbo_eligible = sizeof(F) <= cfg.SBO && ///< fits into SBO buffer
-                                     alignof(F) <= cfg.alignment && ///< and has lower alignment
-                                     (cfg.alignment % alignof(F) == 0) && 
-                                     (!cfg.require_nothrow_movable || std::is_nothrow_move_constructible_v<F>);
-
     FunctionContainer() noexcept requires (cfg.can_be_empty)
     : call{nullptr}
     , actions{noop_actions}
@@ -201,29 +238,6 @@ public:
         if constexpr (is_sbo_eligible<function_type>) { 
             /// [sbo] created in-place in SBO buffer
             new(&data.sbo) function_type(std::forward<F>(callable));
-
-            call = +[](const_correct<memory>& mem, Args... args) {
-                auto& f = mem.template as_sbo<function_type>();
-                if constexpr (cfg.allow_return_type_conversion) {
-                    if constexpr (!std::is_void_v<R>) { 
-                        return R( f(args...) ); 
-                    } else {
-                        f(args...);
-                    }
-                } else {
-                    return f(args...);
-                }
-            };
-
-            /// In-place function case
-            if constexpr (!cfg.movable && !cfg.copyable) {
-                actions = sbo_dtor_action<function_type>;
-            
-            /// movable and optionally copyable too
-            } else { 
-                actions = sbo_multiple_actions<function_type>;
-            }
-
         /// dynamic memory allocation case
         } else { 
             static_assert(cfg.allow_heap, 
@@ -231,26 +245,17 @@ public:
             
             /// [ptr] allocated on the heap
             data.ptr = new function_type{std::forward<F>(callable)};
+        }
 
-            call = +[](const_correct<memory>& mem, Args... args) {
-                auto& f = *mem.template ptr_to<function_type>();
-                if constexpr (cfg.allow_return_type_conversion) {
-                    if constexpr (!std::is_void_v<R>) { 
-                        return R( f(args...) ); 
-                    } else {
-                        f(args...);
-                    }
-                } else {
-                    return f(args...);
-                }
-            };
+        call = caller_for<F>;
 
-            if constexpr (!cfg.movable && !cfg.copyable) {
-                actions = ptr_dtor_action<function_type>;
-            } else { 
-                /// movable and optionally copyable too
-                actions = ptr_multiple_actions<function_type>;
-            }
+        /// In-place function case
+        if constexpr (!cfg.movable && !cfg.copyable) {
+            actions = dtor_action<function_type>;
+        
+        /// movable and optionally copyable too
+        } else { 
+            actions = multiple_actions<function_type>;
         }
     }
 
