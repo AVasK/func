@@ -290,4 +290,109 @@ int main() {
             assert(true);
         }
     }
+
+    /// Move-eligible trait check:
+    {
+        constexpr vx::cfg::function move_only_cfg = {
+            .require_nothrow_movable = true,
+            .can_be_empty = false,
+            .check_empty = false,
+            // .allow_heap = false,
+            .copyable = false,
+            .movable = true
+        };
+
+        constexpr vx::cfg::function move_only_cfg2 = {
+            .require_nothrow_movable = false, ///< so that's not the problem for SBO anymore
+            .can_be_empty = false,
+            .check_empty = false,
+            // .allow_heap = false,
+            .copyable = false,
+            .movable = true
+        };
+
+        constexpr vx::cfg::function inplace_cfg = {
+            .require_nothrow_movable = true,
+            .can_be_empty = false,
+            .check_empty = false,
+            .allow_heap = false,
+            .copyable = false,
+            .movable = true
+        };
+
+        constexpr vx::cfg::function overaligned_cfg = {
+            .alignment = 32,
+            .require_nothrow_movable = true,
+            .can_be_empty = false,
+            .check_empty = false,
+            .copyable = false,
+            .movable = true
+        };
+
+        constexpr vx::cfg::function huge_inplace_cfg = {
+            .SBO {100},
+            .require_nothrow_movable = true,
+            .can_be_empty = false,
+            .check_empty = false,
+            .allow_heap = false,
+            .copyable = false,
+            .movable = true
+        };
+
+        struct SmallTrouble {
+            SmallTrouble() = default;
+            SmallTrouble (SmallTrouble&&) {} /// non noexcept, non trivial
+            int operator()() const { return 42; }
+        };
+
+        struct BiggerTrouble {
+            const char buffer [100];
+            int operator()() const { return 32; }
+        };
+
+        struct alignas(32) AlignmentTrouble {
+            int operator()() const { return 22; }
+        };
+
+        struct NoTrouble {
+            int operator()() const { return 12; }
+        };
+
+        static_assert( std::is_constructible_v<vx::func<int() const, move_only_cfg>, SmallTrouble>,
+            "Still constructible from it, but will use the heap for that");
+        static_assert( not std::is_constructible_v<vx::func<int() const, inplace_cfg>, SmallTrouble>,
+            "Not constructible since will have to use the heap which is forbidden");
+
+        /// Thanks to the .require_nothrow_movable we have the whole func nothrow_movable:
+        static_assert( std::is_nothrow_move_constructible_v<vx::func<int() const, move_only_cfg>> );
+        static_assert( std::is_nothrow_move_assignable_v<vx::func<int() const, move_only_cfg>> );
+
+        /// The price, however, is that the non-nothrow-movable objects will be stored on the heap, even if 
+        /// otherwise they would fit into the SBO buffer
+
+        /// Here's how we can check if our type will be stored in the SBO buffer and won't trigger the heap allocation:
+        /// general usage: vx::is_sbo_eligible<vx::func<signature, cfg>, OurType> -> bool
+        static_assert( not vx::is_sbo_eligible<vx::func<int(), move_only_cfg>, SmallTrouble>, 
+            "the SmallTrouble is not sbo eligible since it's not nothrow movable");
+        /// Same but accessed through the class itself
+        static_assert( not vx::func<int(), move_only_cfg>::is_sbo_eligible<BiggerTrouble> );
+        static_assert( not vx::func<int(), move_only_cfg>::is_sbo_eligible<AlignmentTrouble> );
+        /// you can overalign though
+        static_assert( vx::func<int(), overaligned_cfg>::is_sbo_eligible<AlignmentTrouble> );
+        
+        /// But with these configurations it's OK and it will in fact be stored in SBO
+        static_assert( vx::is_sbo_eligible<vx::func<int(), move_only_cfg2>, SmallTrouble> );
+        static_assert( vx::is_sbo_eligible<vx::func<int(), huge_inplace_cfg>, BiggerTrouble> );
+
+        /// However we will lose the noexcept property for moving stuff around. However the choice is always yours ;)
+        static_assert( not std::is_nothrow_move_constructible_v<vx::func<int() const, move_only_cfg2>> );
+        static_assert( not std::is_nothrow_move_assignable_v<vx::func<int() const, move_only_cfg2>> );
+
+        /// No trouble whatsoever for good types
+        static_assert( vx::func<int(), move_only_cfg>::is_sbo_eligible<NoTrouble> );
+
+        vx::func<int() const, move_only_cfg> f = SmallTrouble{};
+        const vx::func<int() const, move_only_cfg> f2 = std::move(f);
+        assert(f2() == 42);
+    }
 }

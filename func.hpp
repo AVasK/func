@@ -21,23 +21,24 @@ struct function {
     std::size_t SBO { 32 };
     std::size_t alignment { alignof(std::max_align_t) };
     bool allow_return_type_conversion { true };
-    bool require_nothrow_invocable {false};
-    bool require_const_invocable {false};
-    bool require_nothrow_movable {true};
-    bool can_be_empty {false};
+    bool require_nothrow_invocable { false };
+    bool require_const_invocable { false };
+    bool require_nothrow_movable { true };
+    bool require_nothrow_relocatable { false }; //!TODO: Implement support for [p1144][p3236]
+    bool can_be_empty { false };
     bool check_empty { false };
     bool allow_heap { true };
     bool copyable { false };
     bool movable { true };
 
     // Setters
-    constexpr function set_nothrow_invocable(bool state=true) const noexcept {
+    [[nodiscard]] constexpr function with_nothrow_invocable(bool state) const noexcept {
         auto copy = *this;
         copy.require_nothrow_invocable = state;
         return copy;
     }
 
-    constexpr function set_const_invocable(bool state=true) const noexcept {
+    [[nodiscard]] constexpr function with_const_invocable(bool state) const noexcept {
         function copy = *this;
         copy.require_const_invocable = state;
         return copy;
@@ -49,13 +50,6 @@ struct function {
 };
 } // namespace configuration
 namespace cfg = configuration;
-
-
-enum class DispatchTag {
-    Dtor,
-    Move,
-    Copy
-};
 
 
 struct bad_function_call : std::exception {
@@ -75,7 +69,7 @@ private:
 template <configuration::function cfg, typename R, typename... Args>
 class FunctionContainer {
     static constexpr auto bufsize = std::max(cfg.SBO, std::size_t{1});
-    using buffer_t = std::byte[bufsize]; //std::array<std::byte, bufsize>;
+    using buffer_t = std::byte[bufsize];
 
     union memory {
         alignas(cfg.alignment) buffer_t sbo;
@@ -103,19 +97,14 @@ class FunctionContainer {
         }
     };
 
-    using dispatch_tag = DispatchTag;
+    template <typename F>
+    using const_correct = std::conditional_t<(cfg.require_const_invocable), std::add_const_t<F>, F>;
+
+    enum class dispatch_tag { Dtor, Move, Copy };
     using p_cleanup = void (*)(memory&) noexcept;
     using p_tagfunc = void (*)(dispatch_tag, memory&, memory*);
     using action_f = std::conditional_t<(cfg.movable || cfg.copyable), p_tagfunc, p_cleanup>; 
-    using invoke_f = std::conditional_t<(cfg.require_const_invocable), 
-        R (*)(memory const&, Args...),
-        R (*)(memory&, Args...)>;
-
-    template <typename F>
-    using const_correct = std::conditional_t<(cfg.require_const_invocable),
-        const F, 
-        F>;
-
+    using invoke_f = R (*)(const_correct<memory> &, Args...);
 
     template <typename F>
     static constexpr p_cleanup sbo_dtor_action =  +[](memory& mem) noexcept { 
@@ -180,22 +169,27 @@ class FunctionContainer {
 
 public:
 
+    template <typename F>
+    static constexpr bool is_sbo_eligible = sizeof(F) <= cfg.SBO && ///< fits into SBO buffer
+                                     alignof(F) <= cfg.alignment && ///< and has lower alignment
+                                     (cfg.alignment % alignof(F) == 0) && 
+                                     (!cfg.require_nothrow_movable || std::is_nothrow_move_constructible_v<F>);
+
     FunctionContainer() noexcept requires (cfg.can_be_empty)
     : call{nullptr}
-    , actions{nullptr}
+    , actions{noop_actions}
     {}
 
     FunctionContainer(std::nullptr_t) noexcept requires (cfg.can_be_empty)
     : call{nullptr}
-    , actions{nullptr}
+    , actions{noop_actions}
     {}
 
     template <std::invocable<Args...> F>
-    FunctionContainer (F && callable) requires (!std::same_as<std::decay_t<F>, FunctionContainer>)
-    // requires (cfg.allow_return_type_conversion ? 
-        // (invocable<F, R(Args...)> || std::is_void_v<R>) 
-        // : 
-        // std::is_invocable_r_v<R, F, Args...> && std::is_same_v<std::invoke_result_t<F, Args...>, R>)
+    FunctionContainer (F && callable) requires (
+        !std::same_as<std::decay_t<F>, FunctionContainer>
+        &&
+        (cfg.allow_heap || is_sbo_eligible<std::decay_t<F>>))
     {
         using function_type = std::decay_t<F>;
 
@@ -204,10 +198,7 @@ public:
                 "Noexcept callable expected");
         }
         /// SBO case
-        if constexpr (sizeof(function_type) <= cfg.SBO && ///< fits into SBO buffer
-                      alignof(function_type) <= cfg.alignment && ///< and has lower alignment
-                      (cfg.alignment % alignof(function_type) == 0) && 
-                      (!cfg.require_nothrow_movable || std::is_nothrow_move_constructible_v<function_type>)) { 
+        if constexpr (is_sbo_eligible<function_type>) { 
             /// [sbo] created in-place in SBO buffer
             new(&data.sbo) function_type(std::forward<F>(callable));
 
@@ -301,7 +292,7 @@ public:
     {
         other.move_into(data);
         other.call = nullptr;
-        other.actions = +[](dispatch_tag, memory&, memory*) noexcept {};
+        other.actions = noop_actions;
     }
 
 
@@ -314,7 +305,7 @@ public:
         call = other.call;
         actions = other.actions;
         other.call = nullptr;
-        other.actions = nullptr; //+[](dispatch_tag, memory&, memory*) noexcept {};
+        other.actions = noop_actions;
         return *this;
     }
 
@@ -438,19 +429,26 @@ class func<R(Args...), cfg> : public FunctionContainer<cfg, R, Args...> {
 };
 
 template <typename R, typename... Args, configuration::function cfg>
-class func<R(Args...) const, cfg> : public FunctionContainer<cfg.set_const_invocable(), R, Args...> {
-    using FunctionContainer<cfg.set_const_invocable(), R, Args...>::FunctionContainer;
+class func<R(Args...) const, cfg> : public FunctionContainer<cfg.with_const_invocable(true), R, Args...> {
+    using FunctionContainer<cfg.with_const_invocable(true), R, Args...>::FunctionContainer;
 };
 
 template <typename R, typename... Args, configuration::function cfg>
-class func<R(Args...) noexcept, cfg> : public FunctionContainer<cfg.set_nothrow_invocable(), R, Args...> {
-    using FunctionContainer<cfg.set_nothrow_invocable(), R, Args...>::FunctionContainer;
+class func<R(Args...) noexcept, cfg> : public FunctionContainer<cfg.with_nothrow_invocable(true), R, Args...> {
+    using FunctionContainer<cfg.with_nothrow_invocable(true), R, Args...>::FunctionContainer;
 };
 
 template <typename R, typename... Args, configuration::function cfg>
-class func<R(Args...) const noexcept, cfg> : public FunctionContainer<cfg.set_const_invocable().set_nothrow_invocable(), R, Args...> {
-    using FunctionContainer<cfg.set_const_invocable().set_nothrow_invocable(), R, Args...>::FunctionContainer;
+class func<R(Args...) const noexcept, cfg> : public FunctionContainer<cfg.with_const_invocable(true).with_nothrow_invocable(true), R, Args...> {
+    using FunctionContainer<cfg.with_const_invocable(true).with_nothrow_invocable(true), R, Args...>::FunctionContainer;
 };
+
+
+/// @brief A helper trait to check if the type F is sbo eligible (i.e. possible to use with small buffer optimization)
+/// @tparam function - func<signature, cfg>
+/// @tparam F - type to check sbo eligibility for
+template <class function, typename F>
+constexpr bool is_sbo_eligible = function::template is_sbo_eligible<F>;
 
 } // namespace vx
 
