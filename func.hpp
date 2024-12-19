@@ -21,10 +21,11 @@ struct function {
     std::size_t SBO { 32 };
     std::size_t alignment { alignof(std::max_align_t) };
     bool allow_return_type_conversion { true };
+    bool require_nothrow_relocatable { false }; //!TODO: Implement support for [p1144][p3236]
     bool require_nothrow_invocable { false };
+    bool require_nothrow_copyable { false };
     bool require_const_invocable { false };
     bool require_nothrow_movable { true };
-    bool require_nothrow_relocatable { false }; //!TODO: Implement support for [p1144][p3236]
     bool can_be_empty { false };
     bool check_empty { false };
     bool allow_heap { true };
@@ -64,6 +65,8 @@ struct bad_function_operation : std::exception {
 private:
     const char * const error_message = "";
 };
+
+namespace detail {
 
 // SBO memory
 template <std::size_t capacity, std::size_t alignment>
@@ -122,7 +125,7 @@ union memory_SBO {
 
 
 template <configuration::function cfg, typename R, typename... Args>
-class FunctionContainer {
+class func_base {
 public:
     template <typename F>
     static constexpr bool is_sbo_eligible = sizeof(F) <= cfg.SBO && ///< fits into SBO buffer
@@ -132,16 +135,18 @@ public:
 
 private:
     static constexpr auto bufsize = std::max(cfg.SBO, std::size_t{1});
-    using memory = vx::memory_SBO<bufsize, cfg.alignment>;
+    using memory = memory_SBO<bufsize, cfg.alignment>;
 
     template <typename F>
     using const_correct = std::conditional_t<(cfg.require_const_invocable), std::add_const_t<F>, F>;
 
+    static constexpr bool is_tagfunc_nothrow_movable = (cfg.require_nothrow_movable || not cfg.movable) && (cfg.require_nothrow_copyable || not cfg.copyable);
+
     enum class dispatch_tag { Dtor, Move, Copy };
     using p_cleanup = void (*)(memory&) noexcept;
-    using p_tagfunc = void (*)(dispatch_tag, memory&, memory*);
+    using p_tagfunc = void (*)(dispatch_tag, memory&, memory*) noexcept(is_tagfunc_nothrow_movable);
     using action_f = std::conditional_t<(cfg.movable || cfg.copyable), p_tagfunc, p_cleanup>; 
-    using invoke_f = R (*)(const_correct<memory> &, Args...);
+    using invoke_f = R (*)(const_correct<memory> &, Args...) noexcept(cfg.require_nothrow_invocable);
 
     template <typename F>
     static constexpr p_cleanup dtor_action =  +[](memory& mem) noexcept { 
@@ -153,7 +158,7 @@ private:
     };
 
     template <typename F>
-    static constexpr p_tagfunc multiple_actions = +[](dispatch_tag cmd, memory& mem, memory* new_mem=nullptr) { 
+    static constexpr p_tagfunc multiple_actions = +[](dispatch_tag cmd, memory& mem, memory* new_mem=nullptr) noexcept(is_tagfunc_nothrow_movable) { 
         switch (cmd) {
             case dispatch_tag::Dtor: {
                 if constexpr (is_sbo_eligible<F>) {
@@ -186,7 +191,7 @@ private:
     };
 
     template <typename F>
-    static auto& as_invocable(const_correct<memory>& mem) {
+    static auto& as_invocable(const_correct<memory>& mem) noexcept {
         if constexpr (is_sbo_eligible<F>) {
             return mem.template as_sbo<F>();
         } else {
@@ -195,7 +200,7 @@ private:
     }
 
     template <typename F>
-    static constexpr invoke_f caller_for = +[](const_correct<memory>& mem, Args... args) {
+    static constexpr invoke_f caller_for = +[](const_correct<memory>& mem, Args... args) noexcept(cfg.require_nothrow_invocable) {
         auto& f = as_invocable<F>(mem);
         if constexpr (cfg.allow_return_type_conversion) {
             if constexpr (!std::is_void_v<R>) { 
@@ -212,20 +217,20 @@ private:
 
 
 public:
-    FunctionContainer() noexcept requires (cfg.can_be_empty)
+    func_base() noexcept requires (cfg.can_be_empty)
     : call{nullptr}
     , actions{noop_actions}
     {}
 
-    FunctionContainer(std::nullptr_t) noexcept requires (cfg.can_be_empty)
+    func_base(std::nullptr_t) noexcept requires (cfg.can_be_empty)
     : call{nullptr}
     , actions{noop_actions}
     {}
+
 
     template <std::invocable<Args...> F>
-    FunctionContainer (F && callable) requires (
-        !std::same_as<std::decay_t<F>, FunctionContainer>
-        &&
+    func_base (F && callable) requires (
+        !std::same_as<std::decay_t<F>, func_base> &&
         (cfg.allow_heap || is_sbo_eligible<std::decay_t<F>>))
     {
         using function_type = std::decay_t<F>;
@@ -234,17 +239,14 @@ public:
             static_assert(noexcept(std::invoke(callable, std::declval<Args>()...)),
                 "Noexcept callable expected");
         }
-        /// SBO case
-        if constexpr (is_sbo_eligible<function_type>) { 
-            /// [sbo] created in-place in SBO buffer
-            new(&data.sbo) function_type(std::forward<F>(callable));
-        /// dynamic memory allocation case
-        } else { 
+        
+        if constexpr (is_sbo_eligible<function_type>) { /// SBO case
+            new(&data.sbo) function_type(std::forward<F>(callable)); ///< [sbo] created in-place in SBO buffer
+        } else { /// dynamic memory allocation case
             static_assert(cfg.allow_heap, 
                 "The callable doesn't fit into the SBO buffer [Heap allocation disallowed by the configuration]");
             
-            /// [ptr] allocated on the heap
-            data.ptr = new function_type{std::forward<F>(callable)};
+            data.ptr = new function_type{std::forward<F>(callable)}; ///< [ptr] allocated on the heap
         }
 
         call = caller_for<F>;
@@ -252,16 +254,13 @@ public:
         /// In-place function case
         if constexpr (!cfg.movable && !cfg.copyable) {
             actions = dtor_action<function_type>;
-        
-        /// movable and optionally copyable too
-        } else { 
+        } else { /// movable and optionally copyable too
             actions = multiple_actions<function_type>;
         }
     }
 
-
     // template <configuration::function cfg2>
-    // FunctionContainer (FunctionContainer<cfg2, R, Args...> && other)
+    // func_base (func_base<cfg2, R, Args...> && other)
     // noexcept(cfg.SBO == 0 || cfg.require_nothrow_movable)
     // requires (
     //     cfg.SBO >= cfg2.SBO && cfg.alignment >= cfg2.alignment  ///< guaranteed to fit into target's SBO
@@ -289,34 +288,30 @@ public:
     // }
 
     /// MOVE (if movable == true)
-    FunctionContainer(FunctionContainer&& other)
+    func_base(func_base&& other)
     noexcept(cfg.SBO == 0 || cfg.require_nothrow_movable)
     requires (cfg.movable)
-    : call{other.call}
-    , actions{other.actions}
     {
         other.move_into(data);
-        other.call = nullptr;
-        other.actions = noop_actions;
+        call = std::exchange(other.call, nullptr);
+        actions = std::exchange(other.actions, noop_actions);
     }
 
 
-    FunctionContainer& operator= (FunctionContainer&& other) 
+    func_base& operator= (func_base&& other) 
     noexcept(cfg.SBO == 0 || cfg.require_nothrow_movable)
     requires (cfg.movable) 
     {
         reset();
         other.move_into(data);
-        call = other.call;
-        actions = other.actions;
-        other.call = nullptr;
-        other.actions = noop_actions;
+        call = std::exchange(other.call, nullptr);
+        actions = std::exchange(other.actions, noop_actions);
         return *this;
     }
 
 
     /// COPY (if copyable == true)
-    FunctionContainer(FunctionContainer const& other) requires (cfg.copyable) 
+    func_base(func_base const& other) requires (cfg.copyable) 
     : call{other.call}
     , actions{other.actions} 
     {
@@ -324,7 +319,7 @@ public:
     }
 
 
-    FunctionContainer& operator= (FunctionContainer const& other) requires (cfg.copyable) {
+    func_base& operator= (func_base const& other) requires (cfg.copyable) {
         reset();
         other.copy_into(data);
         call = other.call;
@@ -333,13 +328,20 @@ public:
     }
 
 
-    void swap(FunctionContainer & other) noexcept requires(cfg.movable) {
+    void swap(func_base & other) noexcept requires(cfg.movable) {
         if (&other == this) { return; }
         // std::swap(data, other.data); ///< Probably cannot use that...
+        
+        //!TODO: Check if assembly differs:
+        // memory tmp;
+        // this->move_into(tmp);
+        // other.move_into(data);
+        // actions(dispatch_tag::Move, tmp, &other.data);
+
         memory tmp;
-        this->move_into(tmp);
-        other.move_into(data);
-        actions(dispatch_tag::Move, tmp, &other.data);
+        other.move_into(tmp);
+        this->move_into(other.data);
+        actions(dispatch_tag::Move, tmp, &data);
 
         std::swap(call, other.call);
         std::swap(actions, other.actions);
@@ -370,10 +372,10 @@ public:
 
 
     template <typename R2, typename... Args2, configuration::function cfg2>
-    bool operator== (FunctionContainer<cfg2, R2(Args2...)> const &) const = delete;
+    bool operator== (func_base<cfg2, R2(Args2...)> const &) const = delete;
     
 
-    ~FunctionContainer() {
+    ~func_base() {
         if constexpr (!cfg.movable && !cfg.copyable) {
             actions(get_data());
         } else {
@@ -411,41 +413,30 @@ private:
     action_f actions = nullptr;
 };
 
+} // namespace detail
+
 
 template <typename Signature, configuration::function cfg = configuration::function{}>
 class func;
 
-// template <typename R, typename... Args, configuration::function cfg>
-// class func<R(Args...), cfg> {
-// public:
-//     explicit func(invocable<R(Args...)> auto&& f) 
-//     : func_{std::forward<decltype(f)>(f)} {}
-
-//     R operator() (Args... args) {
-//         return func_(args...);
-//     }
-// private:
-//     FunctionContainer<cfg, R, Args...> func_;
-// };
-
 template <typename R, typename... Args, configuration::function cfg>
-class func<R(Args...), cfg> : public FunctionContainer<cfg, R, Args...> {
-    using FunctionContainer<cfg, R, Args...>::FunctionContainer;
+class func<R(Args...), cfg> : public detail::func_base<cfg, R, Args...> {
+    using detail::func_base<cfg, R, Args...>::func_base;
 };
 
 template <typename R, typename... Args, configuration::function cfg>
-class func<R(Args...) const, cfg> : public FunctionContainer<cfg.with_const_invocable(true), R, Args...> {
-    using FunctionContainer<cfg.with_const_invocable(true), R, Args...>::FunctionContainer;
+class func<R(Args...) const, cfg> : public detail::func_base<cfg.with_const_invocable(true), R, Args...> {
+    using detail::func_base<cfg.with_const_invocable(true), R, Args...>::func_base;
 };
 
 template <typename R, typename... Args, configuration::function cfg>
-class func<R(Args...) noexcept, cfg> : public FunctionContainer<cfg.with_nothrow_invocable(true), R, Args...> {
-    using FunctionContainer<cfg.with_nothrow_invocable(true), R, Args...>::FunctionContainer;
+class func<R(Args...) noexcept, cfg> : public detail::func_base<cfg.with_nothrow_invocable(true), R, Args...> {
+    using detail::func_base<cfg.with_nothrow_invocable(true), R, Args...>::func_base;
 };
 
 template <typename R, typename... Args, configuration::function cfg>
-class func<R(Args...) const noexcept, cfg> : public FunctionContainer<cfg.with_const_invocable(true).with_nothrow_invocable(true), R, Args...> {
-    using FunctionContainer<cfg.with_const_invocable(true).with_nothrow_invocable(true), R, Args...>::FunctionContainer;
+class func<R(Args...) const noexcept, cfg> : public detail::func_base<cfg.with_const_invocable(true).with_nothrow_invocable(true), R, Args...> {
+    using detail::func_base<cfg.with_const_invocable(true).with_nothrow_invocable(true), R, Args...>::func_base;
 };
 
 

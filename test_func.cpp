@@ -363,6 +363,8 @@ int main() {
         static_assert( not std::is_constructible_v<vx::func<int() const, inplace_cfg>, SmallTrouble>,
             "Not constructible since will have to use the heap which is forbidden");
 
+        // vx::func<int() const, inplace_cfg> fx = SmallTrouble{}; ///< produces hard to read error message with requires clause :C
+
         /// Thanks to the .require_nothrow_movable we have the whole func nothrow_movable:
         static_assert( std::is_nothrow_move_constructible_v<vx::func<int() const, move_only_cfg>> );
         static_assert( std::is_nothrow_move_assignable_v<vx::func<int() const, move_only_cfg>> );
@@ -394,5 +396,20 @@ int main() {
         vx::func<int() const, move_only_cfg> f = SmallTrouble{};
         const vx::func<int() const, move_only_cfg> f2 = std::move(f);
         assert(f2() == 42);
+    }
+
+    /// Test function pointer case
+    {
+        constexpr vx::cfg::function inplace_cfg = {
+            .SBO = 8,
+            .require_nothrow_movable = true,
+            .can_be_empty = false,
+            .check_empty = false,
+            .allow_heap = false,
+            .copyable = false,
+            .movable = true
+        };
+        vx::func<void(), inplace_cfg> f = +[]{ std::cerr << "Hello!"; };
+        f();
     }
 }
