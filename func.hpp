@@ -2,9 +2,10 @@
 
 #include <algorithm> // std::max
 #include <concepts> // std::invocable_r
-#include <utility> // std::size_t
 #include <exception> // std::exception
+#include <memory> // std::addressof
 #include <type_traits> // just in case
+#include <utility> // std::size_t
 
 #if defined __GNUC__ // GCC, Clang
     #define VX_UNREACHABLE() __builtin_unreachable()
@@ -341,7 +342,7 @@ public:
         memory tmp;
         other.move_into(tmp);
         this->move_into(other.data);
-        actions(dispatch_tag::Move, tmp, &data);
+        actions(dispatch_tag::Move, tmp, std::addressof(data));
 
         std::swap(call, other.call);
         std::swap(actions, other.actions);
@@ -400,11 +401,11 @@ protected:
     }
 
     void move_into(memory& mem) {
-        actions(dispatch_tag::Move, data, &mem);
+        actions(dispatch_tag::Move, data, std::addressof(mem));
     }
 
     void copy_into(memory& mem) const {
-        actions(dispatch_tag::Copy, const_cast<memory&>(data), &mem);
+        actions(dispatch_tag::Copy, const_cast<memory&>(data), std::addressof(mem));
     }
 
 private:
