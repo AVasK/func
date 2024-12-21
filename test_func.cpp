@@ -398,6 +398,39 @@ int main() {
         assert(f2() == 42);
     }
 
+
+    /// Test target
+    {
+        constexpr vx::cfg::function cfg = {
+            .enable_typeinfo = true,
+            .movable = true,
+            .copyable = true
+        };
+
+        constexpr vx::cfg::function min_cfg = {
+            .movable = false,
+            .enable_typeinfo = true
+        };
+
+        struct X {
+            int operator()() { return 7; }
+        };
+
+        struct Y{};
+
+        vx::func<int(), cfg> f = X{};
+        assert(f.target<Y>() == nullptr);
+        assert(f.target<X>() != nullptr);
+        assert(f.target<X>()->operator()() == 7);
+
+        vx::func<int(), min_cfg> mf = X{};
+        assert(mf.target<Y>() == nullptr);
+        assert(mf.target<X>() != nullptr);
+        assert(mf.target<X>()->operator()() == 7);
+        assert(f.target<X>()->operator()() * mf.target<X>()->operator()() - f.target<X>()->operator()() == 42);
+    }
+
+
     /// Test function pointer case
     {
         constexpr vx::cfg::function inplace_cfg = {

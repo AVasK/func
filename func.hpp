@@ -27,6 +27,7 @@ struct function {
     bool require_nothrow_copyable { false };
     bool require_const_invocable { false };
     bool require_nothrow_movable { true };
+    bool enable_typeinfo { false };
     bool can_be_empty { false };
     bool check_empty { false };
     bool allow_heap { true };
@@ -142,11 +143,12 @@ private:
     using const_correct = std::conditional_t<(cfg.require_const_invocable), std::add_const_t<F>, F>;
 
     static constexpr bool is_tagfunc_nothrow_movable = (cfg.require_nothrow_movable || not cfg.movable) && (cfg.require_nothrow_copyable || not cfg.copyable);
+    static constexpr bool has_multiple_actions = (cfg.movable || cfg.copyable || cfg.enable_typeinfo);
 
-    enum class dispatch_tag { Dtor, Move, Copy };
+    enum class dispatch_tag { Dtor, Move, Copy, GetPtr, TypeInfo };
     using p_cleanup = void (*)(memory&) noexcept;
     using p_tagfunc = void (*)(dispatch_tag, memory&, memory*) noexcept(is_tagfunc_nothrow_movable);
-    using action_f = std::conditional_t<(cfg.movable || cfg.copyable), p_tagfunc, p_cleanup>; 
+    using action_f = std::conditional_t<has_multiple_actions, p_tagfunc, p_cleanup>; 
     using invoke_f = R (*)(const_correct<memory> &, Args...) noexcept(cfg.require_nothrow_invocable);
 
     template <typename F>
@@ -170,10 +172,14 @@ private:
             } break;
 
             case dispatch_tag::Move: {
-                if constexpr (is_sbo_eligible<F>) {
-                    mem.template move_into_sbo<F>(new_mem);
+                if constexpr (cfg.movable) {
+                    if constexpr (is_sbo_eligible<F>) {
+                        mem.template move_into_sbo<F>(new_mem);
+                    } else {
+                        mem.template move_into_ptr<F>(new_mem);
+                    }
                 } else {
-                    mem.template move_into_ptr<F>(new_mem);
+                    VX_UNREACHABLE();
                 }
             } break;
 
@@ -184,6 +190,26 @@ private:
                     } else {
                         mem.template copy_into_ptr<F>(new_mem);
                     }
+                } else {
+                    VX_UNREACHABLE();
+                }
+            } break;
+
+            case dispatch_tag::GetPtr: {
+                if constexpr (cfg.enable_typeinfo) {
+                    if constexpr (is_sbo_eligible<F>) { 
+                        new_mem->ptr = &mem.template as_sbo<F>(); 
+                    } else { 
+                        new_mem->ptr = mem.template ptr_to<F>(); 
+                    }
+                } else {
+                    VX_UNREACHABLE();
+                }
+            } break;
+
+            case dispatch_tag::TypeInfo: {
+                if constexpr (cfg.enable_typeinfo) {
+                    new_mem->ptr = const_cast<void*>(static_cast<const void*>(&typeid(F)));
                 } else {
                     VX_UNREACHABLE();
                 }
@@ -253,7 +279,7 @@ public:
         call = caller_for<F>;
 
         /// In-place function case
-        if constexpr (!cfg.movable && !cfg.copyable) {
+        if constexpr (not has_multiple_actions) {
             actions = dtor_action<function_type>;
         } else { /// movable and optionally copyable too
             actions = multiple_actions<function_type>;
@@ -367,6 +393,34 @@ public:
     } 
 
 
+    const std::type_info& target_type() const noexcept 
+    requires(cfg.enable_typeinfo) {
+        memory ans;
+        actions(dispatch_tag::TypeInfo, const_cast<memory&>(data), &ans);
+        return *static_cast<const std::type_info*>(ans.ptr);
+    }
+
+
+    template <typename F>
+    F* target() noexcept 
+    requires(cfg.enable_typeinfo) {
+        if (typeid(F) != target_type()) { return nullptr; }
+        memory ans;
+        actions(dispatch_tag::GetPtr, const_cast<memory&>(data), &ans);
+        return reinterpret_cast<F*>(ans.ptr);
+    }
+
+
+    template <typename F>
+    const F* target() const noexcept 
+    requires(cfg.enable_typeinfo) {
+        if (typeid(F) != target_type()) { return nullptr; }
+        memory ans;
+        actions(dispatch_tag::GetPtr, const_cast<memory&>(data), &ans);
+        return reinterpret_cast<const F*>(ans.ptr);
+    }
+
+
     operator bool() const noexcept {
         return call != nullptr; 
     }
@@ -377,7 +431,7 @@ public:
     
 
     ~func_base() {
-        if constexpr (!cfg.movable && !cfg.copyable) {
+        if constexpr (not has_multiple_actions) {
             actions(get_data());
         } else {
             if (call == nullptr) { return; } /// moved-out
