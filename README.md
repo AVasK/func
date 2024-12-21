@@ -8,10 +8,11 @@ vx::configuration::function {
     std::size_t SBO { 32 };
     std::size_t alignment { alignof(std::max_align_t) };
     bool allow_return_type_conversion { true };
-    bool require_nothrow_invocable {false};
-    bool require_const_invocable {false};
-    bool require_nothrow_movable {true};
-    bool can_be_empty {false};
+    bool require_nothrow_invocable { false };
+    bool require_const_invocable { false };
+    bool require_nothrow_movable { true };
+    bool enable_typeinfo { false };
+    bool can_be_empty { false };
     bool check_empty { false };
     bool allow_heap { true };
     bool copyable { false };
