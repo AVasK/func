@@ -18,7 +18,7 @@
 
 namespace vx {
 
-namespace configuration {
+namespace cfg {
 struct func {
     std::size_t SBO { 32 };
     std::size_t alignment { alignof(std::max_align_t) };
@@ -56,8 +56,7 @@ struct func {
 
 using function = func;
 
-} // namespace configuration
-namespace cfg = configuration;
+} // namespace cfg
 
 
 struct bad_function_call : std::exception {
@@ -148,7 +147,7 @@ union memory_SBO {
 };
 
 
-template <configuration::function cfg, typename R, typename... Args>
+template <cfg::function cfg, typename R, typename... Args>
 class func_base {
 public:
     template <typename F>
@@ -508,7 +507,7 @@ public:
     }
 
 
-    template <typename R2, typename... Args2, configuration::function cfg2>
+    template <typename R2, typename... Args2, cfg::function cfg2>
     bool operator== (func_base<cfg2, R2(Args2...)> const &) const = delete;
     
 
@@ -571,25 +570,25 @@ private:
 } // namespace detail
 
 
-template <typename Signature, configuration::function cfg = configuration::function{}>
+template <typename Signature, cfg::function cfg = cfg::function{}>
 class func;
 
-template <typename R, typename... Args, configuration::function cfg>
+template <typename R, typename... Args, cfg::function cfg>
 class func<R(Args...), cfg> : public detail::func_base<cfg, R, Args...> {
     using detail::func_base<cfg, R, Args...>::func_base;
 };
 
-template <typename R, typename... Args, configuration::function cfg>
+template <typename R, typename... Args, cfg::function cfg>
 class func<R(Args...) const, cfg> : public detail::func_base<cfg.with_const_invocable(true), R, Args...> {
     using detail::func_base<cfg.with_const_invocable(true), R, Args...>::func_base;
 };
 
-template <typename R, typename... Args, configuration::function cfg>
+template <typename R, typename... Args, cfg::function cfg>
 class func<R(Args...) noexcept, cfg> : public detail::func_base<cfg.with_nothrow_invocable(true), R, Args...> {
     using detail::func_base<cfg.with_nothrow_invocable(true), R, Args...>::func_base;
 };
 
-template <typename R, typename... Args, configuration::function cfg>
+template <typename R, typename... Args, cfg::function cfg>
 class func<R(Args...) const noexcept, cfg> : public detail::func_base<cfg.with_const_invocable(true).with_nothrow_invocable(true), R, Args...> {
     using detail::func_base<cfg.with_const_invocable(true).with_nothrow_invocable(true), R, Args...>::func_base;
 };
