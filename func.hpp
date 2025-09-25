@@ -3,8 +3,9 @@
 #include <algorithm> // std::max
 #include <concepts> // std::invocable_r
 #include <exception> // std::exception
+#include <functional> // std::invoke
 #include <memory> // std::addressof
-#include <type_traits> // just in case
+#include <type_traits>
 #include <utility> // std::size_t
 
 #if defined __GNUC__ // GCC, Clang
@@ -18,7 +19,7 @@
 namespace vx {
 
 namespace configuration {
-struct function {
+struct func {
     std::size_t SBO { 32 };
     std::size_t alignment { alignof(std::max_align_t) };
     bool allow_return_type_conversion { true };
@@ -27,22 +28,23 @@ struct function {
     bool require_nothrow_copyable { false };
     bool require_const_invocable { false };
     bool require_nothrow_movable { true };
+    bool optimize_for_func_ptrs { true };
     bool enable_typeinfo { false };
     bool can_be_empty { false };
     bool check_empty { false };
     bool allow_heap { true };
-    bool copyable { false };
+    bool copyable { true };
     bool movable { true };
 
     // Setters
-    [[nodiscard]] constexpr function with_nothrow_invocable(bool state) const noexcept {
+    [[nodiscard]] constexpr func with_nothrow_invocable(bool state) const noexcept {
         auto copy = *this;
         copy.require_nothrow_invocable = state;
         return copy;
     }
 
-    [[nodiscard]] constexpr function with_const_invocable(bool state) const noexcept {
-        function copy = *this;
+    [[nodiscard]] constexpr func with_const_invocable(bool state) const noexcept {
+        func copy = *this;
         copy.require_const_invocable = state;
         return copy;
     }
@@ -51,6 +53,9 @@ struct function {
         return can_be_empty || check_empty;
     }
 };
+
+using function = func;
+
 } // namespace configuration
 namespace cfg = configuration;
 
@@ -70,6 +75,17 @@ private:
 
 namespace detail {
 
+// Allocator wrapper
+template <typename F, typename Allocator>
+struct with_allocator {
+    F func;
+#ifdef _MSC_VER
+    [[msvc::no_unique_address]] Allocator alloc; // thanks for the mess, MSVC
+#else 
+    [[no_unique_address]] Allocator alloc;
+#endif
+};
+
 // SBO memory
 template <std::size_t capacity, std::size_t alignment>
 union memory_SBO {
@@ -87,30 +103,36 @@ union memory_SBO {
         return reinterpret_cast<F const&>(*this);
     }
 
+    // template <typename F>
+    // F&& as_sbo() && {
+    //     return reinterpret_cast<F&&>(*this);
+    // }
+
     template <typename F>
-    F*& ptr_to() {
-        return reinterpret_cast<F*&>(*this);
+    std::remove_reference_t<F>*& ptr_to() {
+        return reinterpret_cast<std::remove_reference_t<F>*&>(*this);
     }
 
     template <typename F>
-    const F* const& ptr_to() const {
-        return reinterpret_cast<const F* const&>(*this);
+    const std::remove_reference_t<F>* const& ptr_to() const {
+        return reinterpret_cast<const std::remove_reference_t<F>* const&>(*this);
     }
 
     template <typename F>
-    void move_into_sbo(memory_SBO * other) {
+    void move_into_sbo(memory_SBO * other) noexcept(std::is_nothrow_move_constructible_v<F>) {
         new(other) F(std::move(as_sbo<F>()));
     }
 
     template <typename>
-    void move_into_ptr(memory_SBO * other) {
+    void move_into_ptr(memory_SBO * other) noexcept {
         other->ptr = ptr;
         ptr = nullptr;
     }
 
     template <typename F>
     void copy_into_sbo(memory_SBO * dest) const noexcept(std::is_nothrow_copy_constructible_v<F>) {
-        dest->template as_sbo<F>() = this->as_sbo<F>();
+        // dest->template as_sbo<F>() = this->as_sbo<F>();
+        new(dest) F(this->as_sbo<F>());
     }
 
     template <typename F>
@@ -135,6 +157,10 @@ public:
                                      (cfg.alignment % alignof(F) == 0) && 
                                      (!cfg.require_nothrow_movable || std::is_nothrow_move_constructible_v<F>);
 
+    // template <>
+    // static constexpr bool is_sbo_eligible<R (*)(Args...)> = sizeof(R (*)(Args...)) <= cfg.SBO && 
+                                                            // alignof(R (*)(Args...)) <= cfg.alignment;
+
 private:
     static constexpr auto bufsize = std::max(cfg.SBO, std::size_t{1});
     using memory = memory_SBO<bufsize, cfg.alignment>;
@@ -149,7 +175,10 @@ private:
     using p_cleanup = void (*)(memory&) noexcept;
     using p_tagfunc = void (*)(dispatch_tag, memory&, memory*) noexcept(is_tagfunc_nothrow_movable);
     using action_f = std::conditional_t<has_multiple_actions, p_tagfunc, p_cleanup>; 
-    using invoke_f = R (*)(const_correct<memory> &, Args...) noexcept(cfg.require_nothrow_invocable);
+    using invoker_type = R (*)(const_correct<memory> &, Args...) noexcept(cfg.require_nothrow_invocable);
+    using invoke_f = std::conditional_t<cfg.optimize_for_func_ptrs, 
+        void(*)(), // type-erased: R(*)(Args...) if c func ptr is stored, R(*)(const_correct<memory>&, Args...) otherwise
+        invoker_type>;
 
     template <typename F>
     static constexpr p_cleanup dtor_action =  +[](memory& mem) noexcept { 
@@ -172,7 +201,8 @@ private:
             } break;
 
             case dispatch_tag::Move: {
-                if constexpr (cfg.movable) {
+                // static_assert(std::is_move_constructible_v<F>);
+                if constexpr (cfg.movable && std::is_move_constructible_v<F>) {
                     if constexpr (is_sbo_eligible<F>) {
                         mem.template move_into_sbo<F>(new_mem);
                     } else {
@@ -184,13 +214,15 @@ private:
             } break;
 
             case dispatch_tag::Copy: {
-                if constexpr (cfg.copyable) {
+                // static_assert(std::is_copy_constructible_v<F>);
+                if constexpr (cfg.copyable && std::is_copy_constructible_v<F>) {
                     if constexpr (is_sbo_eligible<F>) {
                         mem.template copy_into_sbo<F>(new_mem);
                     } else {
                         mem.template copy_into_ptr<F>(new_mem);
                     }
                 } else {
+                    // std::cerr << "BOOM: non-copyable copy, wtf\n";
                     VX_UNREACHABLE();
                 }
             } break;
@@ -227,7 +259,7 @@ private:
     }
 
     template <typename F>
-    static constexpr invoke_f caller_for = +[](const_correct<memory>& mem, Args... args) noexcept(cfg.require_nothrow_invocable) {
+    static constexpr invoker_type caller_for = +[](const_correct<memory>& mem, Args... args) noexcept(cfg.require_nothrow_invocable) {
         auto& f = as_invocable<F>(mem);
         if constexpr (cfg.allow_return_type_conversion) {
             if constexpr (!std::is_void_v<R>) { 
@@ -240,24 +272,39 @@ private:
         }
     };
 
+
+    static constexpr invoker_type empty_call = +[]([[maybe_unused]] const_correct<memory>& mem, Args...) {
+        throw vx::bad_function_call{};
+    };
+
     static constexpr p_tagfunc noop_actions = +[](dispatch_tag, memory&, memory*) noexcept {};
 
 
 public:
-    func_base() noexcept requires (cfg.can_be_empty)
+    func_base() noexcept requires (cfg.can_be_empty && (cfg.copyable || cfg.movable))
     : call{nullptr}
     , actions{noop_actions}
     {}
 
-    func_base(std::nullptr_t) noexcept requires (cfg.can_be_empty)
+    func_base() noexcept requires (cfg.can_be_empty && not (cfg.copyable || cfg.movable))
+    : call{nullptr}
+    , actions{nullptr}
+    {}
+
+    func_base(std::nullptr_t) noexcept requires (cfg.can_be_empty && (cfg.copyable || cfg.movable))
     : call{nullptr}
     , actions{noop_actions}
+    {}
+
+    func_base(std::nullptr_t) noexcept requires (cfg.can_be_empty && not (cfg.copyable || cfg.movable))
+    : call{nullptr}
+    , actions{nullptr}
     {}
 
 
     template <std::invocable<Args...> F>
     func_base (F && callable) requires (
-        !std::same_as<std::decay_t<F>, func_base> &&
+        !std::derived_from<std::remove_cvref_t<F>, func_base> &&
         (cfg.allow_heap || is_sbo_eligible<std::decay_t<F>>))
     {
         using function_type = std::decay_t<F>;
@@ -266,6 +313,12 @@ public:
             static_assert(noexcept(std::invoke(callable, std::declval<Args>()...)),
                 "Noexcept callable expected");
         }
+
+        static_assert(cfg.copyable ? std::is_copy_constructible_v<F> : true, 
+        "The callable has to be copyable");
+
+        static_assert(cfg.movable ? std::is_move_constructible_v<F> : true, 
+        "The callable has to be movable");
         
         if constexpr (is_sbo_eligible<function_type>) { /// SBO case
             new(&data.sbo) function_type(std::forward<F>(callable)); ///< [sbo] created in-place in SBO buffer
@@ -276,7 +329,11 @@ public:
             data.ptr = new function_type{std::forward<F>(callable)}; ///< [ptr] allocated on the heap
         }
 
-        call = caller_for<F>;
+        if constexpr (cfg.optimize_for_func_ptrs) {
+            call = reinterpret_cast<void(*)()>(caller_for<F>);
+        } else {
+            call = caller_for<F>;
+        }
 
         /// In-place function case
         if constexpr (not has_multiple_actions) {
@@ -285,6 +342,11 @@ public:
             actions = multiple_actions<function_type>;
         }
     }
+
+    func_base(R (*fptr) (Args...)) requires(cfg.optimize_for_func_ptrs)
+    : call{ static_cast<void (*)()>(fptr) }
+    , actions{ nullptr }
+    {}
 
     // template <configuration::function cfg2>
     // func_base (func_base<cfg2, R, Args...> && other)
@@ -368,7 +430,11 @@ public:
         memory tmp;
         other.move_into(tmp);
         this->move_into(other.data);
-        actions(dispatch_tag::Move, tmp, std::addressof(data));
+        if constexpr (cfg.optimize_for_func_ptrs) {
+            if (actions) { actions(dispatch_tag::Move, tmp, std::addressof(data)); }
+        } else {
+            actions(dispatch_tag::Move, tmp, std::addressof(data));
+        }
 
         std::swap(call, other.call);
         std::swap(actions, other.actions);
@@ -379,7 +445,15 @@ public:
         if constexpr (cfg.check_empty) {
             if (call == nullptr) { throw bad_function_call{}; }
         }
-        return call(get_data(), std::forward<Args>(args)...);
+        if constexpr (cfg.optimize_for_func_ptrs) {
+            if (actions == nullptr) {
+                return reinterpret_cast<R (*) (Args...)>(call)(std::forward<Args>(args)...);
+            } else {
+                return reinterpret_cast<invoker_type>(call)(get_data(), std::forward<Args>(args)...);
+            }
+        } else {
+            return call(get_data(), std::forward<Args>(args)...);
+        }
     } 
 
 
@@ -389,7 +463,15 @@ public:
         if constexpr (cfg.check_empty) {
             if (call == nullptr) { throw bad_function_call{}; }
         }
-        return call(get_data(), std::forward<Args>(args)...);
+        if constexpr (cfg.optimize_for_func_ptrs) {
+            if (actions == nullptr) {
+                return reinterpret_cast<R (*) (Args...)>(call)(std::forward<Args>(args)...);
+            } else {
+                return reinterpret_cast<invoker_type>(call)(get_data(), std::forward<Args>(args)...);
+            }
+        } else {
+            return call(get_data(), std::forward<Args>(args)...);
+        }
     } 
 
 
@@ -431,8 +513,11 @@ public:
     
 
     ~func_base() {
+        if constexpr (cfg.optimize_for_func_ptrs) {
+            if (actions == nullptr) { return; }
+        }
         if constexpr (not has_multiple_actions) {
-            actions(get_data());
+            actions(get_data()); // deleter
         } else {
             if (call == nullptr) { return; } /// moved-out
             actions(dispatch_tag::Dtor, get_data(), nullptr);
@@ -441,7 +526,16 @@ public:
 
 protected:
     void reset() { 
-        actions(dispatch_tag::Dtor, data, nullptr); 
+        if constexpr (cfg.optimize_for_func_ptrs) {
+            if (actions == nullptr) { 
+                call = nullptr;
+                actions = noop_actions;
+                return; 
+            }
+        }
+        if (actions != nullptr) {
+            actions(dispatch_tag::Dtor, data, nullptr); 
+        }
         call = nullptr;
         actions = noop_actions;
     }
@@ -455,10 +549,16 @@ protected:
     }
 
     void move_into(memory& mem) {
+        if constexpr (cfg.optimize_for_func_ptrs) {
+            if (!actions) { return; }
+        }
         actions(dispatch_tag::Move, data, std::addressof(mem));
     }
 
     void copy_into(memory& mem) const {
+        if constexpr (cfg.optimize_for_func_ptrs) {
+            if (!actions) { return; }
+        }
         actions(dispatch_tag::Copy, const_cast<memory&>(data), std::addressof(mem));
     }
 
@@ -500,6 +600,14 @@ class func<R(Args...) const noexcept, cfg> : public detail::func_base<cfg.with_c
 /// @tparam F - type to check sbo eligibility for
 template <class function, typename F>
 constexpr bool is_sbo_eligible = function::template is_sbo_eligible<F>;
+
+template <typename Signature, std::size_t SBO=48>
+using move_only_func = vx::func<Signature, vx::cfg::func{
+            .SBO=48,
+            .can_be_empty=true,
+            // .check_empty=false,
+            .copyable=false,
+            .movable=true }>;
 
 } // namespace vx
 

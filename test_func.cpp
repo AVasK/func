@@ -5,6 +5,7 @@
 #include <cstddef> // sized ints
 #include <functional>
 #include "func.hpp"
+#include "time.hpp"
 
 using u8 = std::uint8_t;
 
@@ -273,7 +274,8 @@ int main() {
     {
         constexpr vx::cfg::function empty_cfg = {
             .can_be_empty = true,
-            .check_empty = true
+            .check_empty = true,
+            .copyable=false
         };
 
         static_assert( std::is_default_constructible_v<vx::func<int() const, empty_cfg>>);
@@ -439,10 +441,171 @@ int main() {
             .can_be_empty = false,
             .check_empty = false,
             .allow_heap = false,
-            .copyable = false,
+            .copyable = true,
             .movable = true
         };
         vx::func<void(), inplace_cfg> f = +[]{ std::cerr << "Hello!"; };
+        vx::func<void(), inplace_cfg> ff = f;
         f();
+
+        constexpr vx::cfg::function optimized_fptr = {
+            .SBO = 8,
+            .require_nothrow_movable = true,
+            .optimize_for_func_ptrs = true,
+            .can_be_empty = false,
+            .check_empty = false,
+            .allow_heap = false,
+            .copyable = true,
+            .movable = true
+        };
+        vx::func<void(), optimized_fptr> f2 = +[]{ std::cerr << "Hello!"; };
+        vx::func<void(), optimized_fptr> ff2 = f2;
+        // vx::func<void(), optimized_fptr> fff2 = std::move(f2); // ERROR
+        f2();
+    }
+
+    /// Micro bench
+    {
+        constexpr std::size_t N = 1'000'000;
+        constexpr vx::cfg::function inplace_cfg = {
+            .SBO = 32,
+            .require_nothrow_movable = true,
+            .can_be_empty = false,
+            .check_empty = false,
+            .allow_heap = false,
+            .copyable = false,
+            .movable = false
+        };
+
+        constexpr vx::cfg::function optimized_fptr = {
+            .SBO = 32,
+            .require_nothrow_movable = true,
+            .optimize_for_func_ptrs = true,
+            .can_be_empty = false,
+            .check_empty = false,
+            .allow_heap = false,
+            .copyable = false,
+            .movable = false
+        };
+
+        using time_units = vx::time::ms;
+
+        std::cerr << "\n\nBenchmarking function ptr times:";
+
+        // std::function
+        std::cerr << "\nstd::function: " << vx::timeit([&, f = std::function<void()>(+[]{ })]{
+            // std::function<void()> f = +[]{ };
+            for (std::size_t i = 0; i < N; ++i) {
+                f();
+            }
+        }).in<time_units>();
+
+        // std::move_only_function
+        #if defined __cpp_lib_move_only_function
+        std::cerr << "\nstd::move_only_function: " << vx::timeit([&]{
+            std::move_only_function<void()> f = +[]{ };
+            for (std::size_t i = 0; i < N; ++i) {
+                f();
+            }
+        }).in<time_units>();
+        #endif
+
+        // Default
+        std::cerr << "\ndefault: " << vx::timeit([&]{
+            vx::func<void(), inplace_cfg> f = +[]{};
+            for (std::size_t i = 0; i < N; ++i) {
+                f();
+            }
+        }).in<time_units>();
+
+        // Optimized
+        std::cerr << "\noptimized: " << vx::timeit([&]{
+            vx::func<void(), optimized_fptr> f = +[]{};
+            for (std::size_t i = 0; i < N; ++i) {
+                f();
+            }
+        }).in<time_units>();
+
+        // Func ptr:
+        std::cerr << "\nplain fptr: " << vx::timeit([&]{
+            void (*f)() = +[]{};
+            for (std::size_t i = 0; i < N; ++i) {
+                f();
+            }
+        }).in<time_units>();
+
+        int flag = 0;
+        // std::cin >> flag;
+        std::cerr << "\nplain fptr + branch: " << vx::timeit([&]{
+            void (*f)() = +[]{};
+            for (std::size_t i = 0; i < N; ++i) {
+                if (flag == 0) f();
+            }
+        }).in<time_units>();
+
+    }
+
+
+    /// Micro bench for non-ptr callables:
+    {
+        std::cerr << "\n\nBenchmarking non-ptr callables:";
+        constexpr std::size_t N = 1'000'000;
+        constexpr vx::cfg::function inplace_cfg = {
+            .SBO = 8,
+            .require_nothrow_movable = true,
+            .can_be_empty = false,
+            .check_empty = false,
+            .allow_heap = false,
+            .copyable = false,
+            .movable = true
+        };
+
+        constexpr vx::cfg::function optimized_fptr = {
+            .SBO = 8,
+            .require_nothrow_movable = true,
+            .optimize_for_func_ptrs = true,
+            .can_be_empty = false,
+            .check_empty = false,
+            .allow_heap = false,
+            .copyable = false,
+            .movable = true
+        };
+
+        using time_units = vx::time::ms;
+
+        struct A {
+            void operator()() noexcept {}
+        };
+
+        // std::function
+        std::cerr << "\nstd::function: " << vx::timeit([&]{
+            std::function<void()> f = A{};
+            for (std::size_t i = 0; i < N; ++i) {
+                f();
+            }
+        }).in<time_units>();
+
+        // Default
+        std::cerr << "\ndefault: " << vx::timeit([&]{
+            vx::func<void(), inplace_cfg> f = A{};
+            for (std::size_t i = 0; i < N; ++i) {
+                f();
+            }
+        }).in<time_units>();
+
+        std::cerr << "\ndefault (noexcept): " << vx::timeit([&]{
+            vx::func<void() noexcept, inplace_cfg> f = A{};
+            for (std::size_t i = 0; i < N; ++i) {
+                f();
+            }
+        }).in<time_units>();
+
+        // Optimized
+        std::cerr << "\noptimized: " << vx::timeit([&]{
+            vx::func<void(), optimized_fptr> f = A{};
+            for (std::size_t i = 0; i < N; ++i) {
+                f();
+            }
+        }).in<time_units>();
     }
 }
